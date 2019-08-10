@@ -2,10 +2,8 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-library coverage.test.collect_coverage_api_test;
-
 import 'dart:async';
-import 'dart:io';
+import 'dart:convert';
 
 import 'package:coverage/coverage.dart';
 import 'package:coverage/src/util.dart';
@@ -19,62 +17,81 @@ final _isolateLibPath = p.join('test', 'test_files', 'test_app_isolate.dart');
 final _sampleAppFileUri = p.toUri(p.absolute(testAppPath)).toString();
 final _isolateLibFileUri = p.toUri(p.absolute(_isolateLibPath)).toString();
 
-const _timeout = const Duration(seconds: 5);
-
 void main() {
+  test('collect throws when serviceUri is null', () {
+    expect(() => collect(null, true, false, false, Set<String>()),
+        throwsArgumentError);
+  });
+
   test('collect_coverage_api', () async {
-    var json = await _getCoverageResult();
-
-    expect(json.keys, unorderedEquals(['type', 'coverage']));
-
+    final Map<String, dynamic> json = await _collectCoverage();
+    expect(json.keys, unorderedEquals(<String>['type', 'coverage']));
     expect(json, containsPair('type', 'CodeCoverage'));
 
-    var coverage = json['coverage'] as List;
+    final List coverage = json['coverage'];
     expect(coverage, isNotEmpty);
 
-    var sources = coverage.fold(<String, dynamic>{}, (Map map, Map value) {
-      var sourceUri = value['source'];
-
+    final sources = coverage.fold(<String, dynamic>{},
+        (Map<String, dynamic> map, dynamic value) {
+      final String sourceUri = value['source'];
       map.putIfAbsent(sourceUri, () => <Map>[]).add(value);
-
       return map;
     });
 
-    for (var sampleCoverageData in sources[_sampleAppFileUri]) {
-      expect(sampleCoverageData['hits'], isNotEmpty);
+    for (Map sampleCoverageData in sources[_sampleAppFileUri]) {
+      expect(sampleCoverageData['hits'], isNotNull);
     }
 
     for (var sampleCoverageData in sources[_isolateLibFileUri]) {
       expect(sampleCoverageData['hits'], isNotEmpty);
     }
   });
+
+  test('collect_coverage_api with scoped output', () async {
+    final Map<String, dynamic> json =
+        await _collectCoverage(scopedOutput: Set<String>()..add('coverage'));
+    expect(json.keys, unorderedEquals(<String>['type', 'coverage']));
+    expect(json, containsPair('type', 'CodeCoverage'));
+
+    final List coverage = json['coverage'];
+    expect(coverage, isNotEmpty);
+
+    final sources = coverage.fold(<String, dynamic>{},
+        (Map<String, dynamic> map, dynamic value) {
+      final String sourceUri = value['source'];
+      map.putIfAbsent(sourceUri, () => <Map>[]).add(value);
+      return map;
+    });
+
+    for (var key in sources.keys) {
+      final uri = Uri.parse(key);
+      expect(uri.path.startsWith('coverage'), isTrue);
+    }
+  });
 }
 
-Map _coverageData;
-
-Future<Map> _getCoverageResult() async {
-  if (_coverageData == null) {
-    _coverageData = await _collectCoverage();
-  }
-  return _coverageData;
-}
-
-Future<Map> _collectCoverage() async {
-  var openPort = await getOpenPort();
+Future<Map<String, dynamic>> _collectCoverage(
+    {Set<String> scopedOutput}) async {
+  scopedOutput ??= Set<String>();
+  final openPort = await getOpenPort();
 
   // run the sample app, with the right flags
-  var sampleProcFuture = Process
-      .run('dart', [
-    '--enable-vm-service=$openPort',
-    '--pause_isolates_on_exit',
-    testAppPath
-  ])
-      .timeout(_timeout, onTimeout: () {
-    throw 'We timed out waiting for the sample app to finish.';
+  final sampleProcess = await runTestApp(openPort);
+
+  // Capture the VM service URI.
+  final serviceUriCompleter = Completer<Uri>();
+  sampleProcess.stdout
+      .transform(utf8.decoder)
+      .transform(LineSplitter())
+      .listen((line) {
+    if (!serviceUriCompleter.isCompleted) {
+      final Uri serviceUri = extractObservatoryUri(line);
+      if (serviceUri != null) {
+        serviceUriCompleter.complete(serviceUri);
+      }
+    }
   });
+  final Uri serviceUri = await serviceUriCompleter.future;
 
-  var result = collect('127.0.0.1', openPort, true, false, timeout: _timeout);
-  await sampleProcFuture;
-
-  return result;
+  return collect(serviceUri, true, true, false, scopedOutput, timeout: timeout);
 }

@@ -2,19 +2,27 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-library coverage.run_and_collect;
-
 import 'dart:async';
+import 'dart:convert' show utf8, LineSplitter;
 import 'dart:io';
 
 import 'collect.dart';
 import 'util.dart';
 
-Future<Map> runAndCollect(String scriptPath,
-    {List<String> scriptArgs, String packageRoot, Duration timeout}) async {
-  var openPort = await getOpenPort();
+Future<Map<String, dynamic>> runAndCollect(String scriptPath,
+    {List<String> scriptArgs,
+    bool checked = false,
+    String packageRoot,
+    bool includeDart = false,
+    Duration timeout}) async {
+  final dartArgs = [
+    '--enable-vm-service',
+    '--pause_isolates_on_exit',
+  ];
 
-  var dartArgs = ['--enable-vm-service=$openPort', '--pause_isolates_on_exit',];
+  if (checked) {
+    dartArgs.add('--checked');
+  }
 
   if (packageRoot != null) {
     dartArgs.add('--package-root=$packageRoot');
@@ -26,18 +34,29 @@ Future<Map> runAndCollect(String scriptPath,
     dartArgs.addAll(scriptArgs);
   }
 
-  var process = await Process.start('dart', dartArgs);
-
-  try {
-    return collect('127.0.0.1', openPort, true, true, timeout: timeout);
-  } finally {
-    await process.stdout.drain();
-    await process.stderr.drain();
-
-    var code = await process.exitCode;
-
-    if (code < 0) {
-      throw "A critical exception happened in the process: exit code $code";
+  final process = await Process.start('dart', dartArgs);
+  final serviceUriCompleter = Completer<Uri>();
+  process.stdout
+      .transform(utf8.decoder)
+      .transform(const LineSplitter())
+      .listen((line) {
+    final uri = extractObservatoryUri(line);
+    if (uri != null) {
+      serviceUriCompleter.complete(uri);
     }
+  });
+
+  final serviceUri = await serviceUriCompleter.future;
+  Map<String, dynamic> coverage;
+  try {
+    coverage = await collect(serviceUri, true, true, includeDart, Set<String>(),
+        timeout: timeout);
+  } finally {
+    await process.stderr.drain<List<int>>();
   }
+  final exitStatus = await process.exitCode;
+  if (exitStatus != 0) {
+    throw "Process exited with exit code $exitStatus";
+  }
+  return coverage;
 }

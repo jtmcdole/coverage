@@ -2,19 +2,24 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
+import 'dart:async';
 import 'dart:io';
 
 import 'package:args/args.dart';
 import 'package:coverage/coverage.dart';
-import 'package:path/path.dart';
+import 'package:path/path.dart' as p;
 
 /// [Environment] stores gathered arguments information.
 class Environment {
   String sdkRoot;
   String pkgRoot;
+  String packagesPath;
+  String baseDirectory;
   String input;
   IOSink output;
   List<String> reportOn;
+  String bazelWorkspace;
+  bool bazel;
   int workers;
   bool prettyPrint;
   bool lcov;
@@ -22,21 +27,22 @@ class Environment {
   bool verbose;
 }
 
-main(List<String> arguments) async {
+Future<Null> main(List<String> arguments) async {
   final env = parseArgs(arguments);
 
-  List files = filesToProcess(env.input);
+  final List<File> files = filesToProcess(env.input);
   if (env.verbose) {
     print('Environment:');
     print('  # files: ${files.length}');
     print('  # workers: ${env.workers}');
     print('  sdk-root: ${env.sdkRoot}');
     print('  package-root: ${env.pkgRoot}');
+    print('  package-spec: ${env.packagesPath}');
     print('  report-on: ${env.reportOn}');
   }
 
-  var clock = new Stopwatch()..start();
-  var hitmap = await parseCoverage(files, env.workers);
+  final clock = Stopwatch()..start();
+  final hitmap = await parseCoverage(files, env.workers);
 
   // All workers are done. Process the data.
   if (env.verbose) {
@@ -44,15 +50,22 @@ main(List<String> arguments) async {
   }
 
   String output;
-  var resolver = new Resolver(packageRoot: env.pkgRoot, sdkRoot: env.sdkRoot);
-  var loader = new Loader();
+  final resolver = env.bazel
+      ? BazelResolver(workspacePath: env.bazelWorkspace)
+      : Resolver(
+          packagesPath: env.packagesPath,
+          packageRoot: env.pkgRoot,
+          sdkRoot: env.sdkRoot);
+  final loader = Loader();
   if (env.prettyPrint) {
-    output = await new PrettyPrintFormatter(resolver, loader).format(hitmap,
-        reportOn: env.reportOn);
+    output =
+        await PrettyPrintFormatter(resolver, loader, reportOn: env.reportOn)
+            .format(hitmap);
   } else {
     assert(env.lcov);
-    output = await new LcovFormatter(resolver).format(hitmap,
-        reportOn: env.reportOn);
+    output = await LcovFormatter(resolver,
+            reportOn: env.reportOn, basePath: env.baseDirectory)
+        .format(hitmap);
   }
 
   env.output.write(output);
@@ -64,11 +77,15 @@ main(List<String> arguments) async {
   if (env.verbose) {
     if (resolver.failed.length > 0) {
       print('Failed to resolve:');
-      resolver.failed.toSet().forEach((e) => print('  $e'));
+      for (String error in resolver.failed.toSet()) {
+        print('  $error');
+      }
     }
     if (loader.failed.length > 0) {
       print('Failed to load:');
-      loader.failed.toSet().forEach((e) => print('  $e'));
+      for (String error in loader.failed.toSet()) {
+        print('  $error');
+      }
     }
   }
   await env.output.close();
@@ -77,19 +94,26 @@ main(List<String> arguments) async {
 /// Checks the validity of the provided arguments. Does not initialize actual
 /// processing.
 Environment parseArgs(List<String> arguments) {
-  final env = new Environment();
-  var parser = new ArgParser();
+  final env = Environment();
+  final parser = ArgParser();
 
   parser.addOption('sdk-root', abbr: 's', help: 'path to the SDK root');
   parser.addOption('package-root', abbr: 'p', help: 'path to the package root');
+  parser.addOption('packages', help: 'path to the package spec file');
   parser.addOption('in', abbr: 'i', help: 'input(s): may be file or directory');
   parser.addOption('out',
       abbr: 'o', defaultsTo: 'stdout', help: 'output: may be file or stdout');
-  parser.addOption('report-on',
-      allowMultiple: true,
+  parser.addMultiOption('report-on',
       help: 'which directories or files to report coverage on');
   parser.addOption('workers',
       abbr: 'j', defaultsTo: '1', help: 'number of workers');
+  parser.addOption('bazel-workspace',
+      defaultsTo: '', help: 'Bazel workspace directory');
+  parser.addOption('base-directory',
+      abbr: 'b',
+      help: 'the base directory relative to which source paths are output');
+  parser.addFlag('bazel',
+      defaultsTo: false, help: 'use Bazel-style path resolution');
   parser.addFlag('pretty-print',
       abbr: 'r',
       negatable: false,
@@ -102,14 +126,14 @@ Environment parseArgs(List<String> arguments) {
       abbr: 'v', negatable: false, help: 'verbose output');
   parser.addFlag('help', abbr: 'h', negatable: false, help: 'show this help');
 
-  var args = parser.parse(arguments);
+  final args = parser.parse(arguments);
 
-  printUsage() {
+  void printUsage() {
     print('Usage: dart format_coverage.dart [OPTION...]\n');
     print(parser.usage);
   }
 
-  fail(String msg) {
+  void fail(String msg) {
     print('\n$msg\n');
     printUsage();
     exit(1);
@@ -122,23 +146,34 @@ Environment parseArgs(List<String> arguments) {
 
   env.sdkRoot = args['sdk-root'];
   if (env.sdkRoot != null) {
-    env.sdkRoot = normalize(join(absolute(env.sdkRoot), 'lib'));
+    env.sdkRoot = p.normalize(p.join(p.absolute(env.sdkRoot), 'lib'));
     if (!FileSystemEntity.isDirectorySync(env.sdkRoot)) {
       fail('Provided SDK root "${args["sdk-root"]}" is not a valid SDK '
           'top-level directory');
     }
   }
 
+  if (args['package-root'] != null && args['packages'] != null) {
+    fail('Only one of --package-root or --packages may be specified.');
+  }
+
+  env.packagesPath = args['packages'];
+  if (env.packagesPath != null) {
+    if (!FileSystemEntity.isFileSync(env.packagesPath)) {
+      fail('Package spec "${args["packages"]}" not found, or not a file.');
+    }
+  }
+
   env.pkgRoot = args['package-root'];
   if (env.pkgRoot != null) {
-    env.pkgRoot = absolute(normalize(args['package-root']));
+    env.pkgRoot = p.absolute(p.normalize(args['package-root']));
     if (!FileSystemEntity.isDirectorySync(env.pkgRoot)) {
-      fail('Provided package root "${args["package-root"]}" is not directory.');
+      fail('Package root "${args["package-root"]}" is not a directory.');
     }
   }
 
   if (args['in'] == null) fail('No input files given.');
-  env.input = absolute(normalize(args['in']));
+  env.input = p.absolute(p.normalize(args['in']));
   if (!FileSystemEntity.isDirectorySync(env.input) &&
       !FileSystemEntity.isFileSync(env.input)) {
     fail('Provided input "${args["in"]}" is neither a directory nor a file.');
@@ -147,12 +182,22 @@ Environment parseArgs(List<String> arguments) {
   if (args['out'] == 'stdout') {
     env.output = stdout;
   } else {
-    var outpath = absolute(normalize(args['out']));
-    var outfile = new File(outpath)..createSync(recursive: true);
+    final outpath = p.absolute(p.normalize(args['out']));
+    final outfile = File(outpath)..createSync(recursive: true);
     env.output = outfile.openWrite();
   }
 
-  env.reportOn = args['report-on'];
+  env.reportOn = args['report-on'].isNotEmpty ? args['report-on'] : null;
+
+  env.bazel = args['bazel'];
+  env.bazelWorkspace = args['bazel-workspace'];
+  if (env.bazelWorkspace.isNotEmpty && !env.bazel) {
+    stderr.writeln('warning: ignoring --bazel-workspace: --bazel not set');
+  }
+
+  if (args['base-directory'] != null) {
+    env.baseDirectory = p.absolute(args['base-directory']);
+  }
 
   env.lcov = args['lcov'];
   if (args['pretty-print'] && env.lcov) {
@@ -174,13 +219,14 @@ Environment parseArgs(List<String> arguments) {
 /// Given an absolute path absPath, this function returns a [List] of files
 /// are contained by it if it is a directory, or a [List] containing the file if
 /// it is a file.
-List filesToProcess(String absPath) {
-  var filePattern = new RegExp(r'^dart-cov-\d+-\d+.json$');
+List<File> filesToProcess(String absPath) {
+  final filePattern = RegExp(r'^dart-cov-\d+-\d+.json$');
   if (FileSystemEntity.isDirectorySync(absPath)) {
-    return new Directory(absPath)
+    return Directory(absPath)
         .listSync(recursive: true)
-        .where((e) => e is File && filePattern.hasMatch(basename(e.path)))
+        .whereType<File>()
+        .where((e) => filePattern.hasMatch(p.basename(e.path)))
         .toList();
   }
-  return [new File(absPath)];
+  return <File>[File(absPath)];
 }

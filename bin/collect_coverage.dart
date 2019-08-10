@@ -2,7 +2,8 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-import 'dart:convert' show JSON;
+import 'dart:async';
+import 'dart:convert' show json;
 import 'dart:io';
 
 import 'package:args/args.dart';
@@ -10,22 +11,22 @@ import 'package:coverage/src/collect.dart';
 import 'package:logging/logging.dart';
 import 'package:stack_trace/stack_trace.dart';
 
-main(List<String> arguments) async {
+Future<Null> main(List<String> arguments) async {
   Logger.root.level = Level.WARNING;
   Logger.root.onRecord.listen((LogRecord rec) {
     print('${rec.level.name}: ${rec.time}: ${rec.message}');
   });
 
-  var options = _parseArgs(arguments);
+  final options = _parseArgs(arguments);
   await Chain.capture(() async {
-    var coverage = await collect(
-        options.host, options.port, options.resume, options.waitPaused,
+    final coverage = await collect(options.serviceUri, options.resume,
+        options.waitPaused, options.includeDart, options.scopedOutput,
         timeout: options.timeout);
-    options.out.write(JSON.encode(coverage));
+    options.out.write(json.encode(coverage));
     await options.out.close();
-  }, onError: (error, Chain chain) {
-    print(error);
-    print(chain.terse);
+  }, onError: (dynamic error, Chain chain) {
+    stderr.writeln(error);
+    stderr.writeln(chain.terse);
     // See http://www.retro11.de/ouxr/211bsd/usr/include/sysexits.h.html
     // EX_SOFTWARE
     exit(70);
@@ -33,41 +34,54 @@ main(List<String> arguments) async {
 }
 
 class Options {
-  final String host;
-  final int port;
+  Options(this.serviceUri, this.out, this.timeout, this.waitPaused, this.resume,
+      this.includeDart, this.scopedOutput);
+
+  final Uri serviceUri;
   final IOSink out;
   final Duration timeout;
   final bool waitPaused;
   final bool resume;
-  Options(this.host, this.port, this.out, this.timeout, this.waitPaused,
-      this.resume);
+  final bool includeDart;
+  final Set<String> scopedOutput;
 }
 
 Options _parseArgs(List<String> arguments) {
-  var parser = new ArgParser()
+  final parser = ArgParser()
     ..addOption('host',
-        abbr: 'H', defaultsTo: '127.0.0.1', help: 'remote VM host')
-    ..addOption('port', abbr: 'p', help: 'remote VM port', defaultsTo: '8181')
+        abbr: 'H',
+        help: 'remote VM host. DEPRECATED: use --uri',
+        defaultsTo: '127.0.0.1')
+    ..addOption('port',
+        abbr: 'p',
+        help: 'remote VM port. DEPRECATED: use --uri',
+        defaultsTo: '8181')
+    ..addOption('uri', abbr: 'u', help: 'VM observatory service URI')
     ..addOption('out',
         abbr: 'o', defaultsTo: 'stdout', help: 'output: may be file or stdout')
     ..addOption('connect-timeout',
         abbr: 't', help: 'connect timeout in seconds')
+    ..addMultiOption('scope-output',
+        help: 'restrict coverage results so that only scripts that start with '
+            'the provided package path are considered')
     ..addFlag('wait-paused',
         abbr: 'w',
         defaultsTo: false,
         help: 'wait for all isolates to be paused before collecting coverage')
     ..addFlag('resume-isolates',
         abbr: 'r', defaultsTo: false, help: 'resume all isolates on exit')
+    ..addFlag('include-dart',
+        abbr: 'd', defaultsTo: false, help: 'include "dart:" libraries')
     ..addFlag('help', abbr: 'h', negatable: false, help: 'show this help');
 
-  var args = parser.parse(arguments);
+  final args = parser.parse(arguments);
 
-  printUsage() {
-    print('Usage: dart collect_coverage.dart --port=NNNN [OPTION...]\n');
+  void printUsage() {
+    print('Usage: dart collect_coverage.dart --uri=http://... [OPTION...]\n');
     print(parser.usage);
   }
 
-  fail(message) {
+  void fail(String message) {
     print('Error: $message\n');
     printUsage();
     exit(1);
@@ -78,19 +92,32 @@ Options _parseArgs(List<String> arguments) {
     exit(0);
   }
 
-  if (args['port'] == null) fail('port not specified');
-  var port = int.parse(args['port']);
+  Uri serviceUri;
+  if (args['uri'] == null) {
+    // TODO(cbracken) eliminate --host and --port support when VM defaults to
+    // requiring an auth token. Estimated for Dart SDK 1.22.
+    serviceUri = Uri.parse('http://${args['host']}:${args['port']}/');
+  } else {
+    try {
+      serviceUri = Uri.parse(args['uri']);
+    } on FormatException {
+      fail('Invalid service URI specified: ${args['uri']}');
+    }
+  }
 
-  var out;
+  // ignore: avoid_as
+  final scopedOutput = args['scope-output'] as List<String> ?? [];
+
+  IOSink out;
   if (args['out'] == 'stdout') {
     out = stdout;
   } else {
-    var outfile = new File(args['out'])..createSync(recursive: true);
+    final outfile = File(args['out'])..createSync(recursive: true);
     out = outfile.openWrite();
   }
-  var timeout = (args['connect-timeout'] == null)
+  final timeout = (args['connect-timeout'] == null)
       ? null
-      : new Duration(seconds: int.parse(args['connect-timeout']));
-  return new Options(args['host'], port, out, timeout, args['wait-paused'],
-      args['resume-isolates']);
+      : Duration(seconds: int.parse(args['connect-timeout']));
+  return Options(serviceUri, out, timeout, args['wait-paused'],
+      args['resume-isolates'], args['include-dart'], scopedOutput.toSet());
 }
